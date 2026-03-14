@@ -1,45 +1,48 @@
-# Chihuahua vs Muffin - 3LC Kaggle Competition Configuration
 # ============================================================
-# The 3LC x Hack4Impact-UMD AI Hackathon: Data-Centric AI with 3LC
+# 3LC Chihuahua vs Muffin - Kaggle Competition Configuration
+# Data-Centric AI Hackathon (3LC x Hack4Impact-UMD)
+# ============================================================
 
-# Competition Settings
 competition:
-  name: "3LC Chihuahua vs Muffin - Data-Centric AI Challenge"
+  name: "3LC Chihuahua vs Muffin"
   task: "binary_classification"
-  description: "Can you tell them apart? Build an image classifier using data-centric AI with 3LC."
+  description: "Image classifier to distinguish Chihuahua dogs from muffins using data-centric AI."
 
-# Dataset Configuration
 dataset:
-  name: "chihuahua-muffin"
+  name: "chihuahua_muffin"
   num_classes: 2
-  class_names:
-    - "chihuahua"   # 0
-    - "muffin"      # 1
+  classes:
+    chihuahua: 0
+    muffin: 1
 
-# 3LC Project settings
+paths:
+  root: "./data"
+  train: "./data/train"
+  val: "./data/val"
+  test: "./data/test"
+
 tlc:
   project_name: "Chihuahua-Muffin"
   dataset_name: "chihuahua-muffin"
+  enable_logging: true
 
-# Data-Centric Constraints
 constraints:
-  # Model architecture (FIXED - no changes allowed)
-  model: "resnet18"
+  model_architecture: "resnet18"   # Fixed model architecture
 
-# Training Configuration (reference; train.py uses its own constants)
 training:
-  batch_size: 16
-  num_workers: 0
   epochs: 10
+  batch_size: 16
   learning_rate: 0.0001
+  num_workers: 2
   image_size: 128
+  optimizer: "adam"
+  loss_function: "cross_entropy"
 
-# Scoring (Kaggle: accuracy on hidden test set)
 scoring:
-  metric: "accuracy"  # Classification accuracy (0-1)
+  metric: "accuracy"
+  objective: "maximize"
 
-# File Paths (relative to competition root)
-paths:
-  train_dir: "data/train"
-  val_dir: "data/val"
-  test_dir: "data/test"
+system:
+  python_version: "3.11"
+  device: "auto"      # cpu or cuda if available
+  seed: 42
