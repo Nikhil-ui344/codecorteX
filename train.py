@@ -1,14 +1,19 @@
 """
-Improved training pipeline for Chihuahua vs Muffin (3LC competition)
+Train ResNet-18 classifier on Chihuahua vs Muffin dataset using 3LC.
 
-Changes:
-- ResNet18 from scratch (rule compliant)
-- 224 image size
-- better augmentations
-- mixed precision training
-- cosine learning rate scheduler
-- faster dataloading
-- improved embeddings
+- 3LC Table loading (train + val). By default uses .latest() so Dashboard
+ edits are picked up automatically. Optional: load by explicit table URLs
+ (see OPTION 2 in code, commented out).
+- ResNet-18 training with weighted sampling (exclude undefined).
+- Per-sample metrics and embeddings collection.
+- Best model saved to best_model.pth (overwritten each run).
+
+Usage:
+   python register_tables.py  # Run once
+   python train.py
+
+Outputs:
+   best_model.pth  - Best checkpoint by validation accuracy (overwritten each run).
 """
 
 import torch
@@ -25,373 +30,251 @@ from pathlib import Path
 import random
 import numpy as np
 import os
-import yaml
-from contextlib import nullcontext
 
 # ============================================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================================
 
-EPOCHS = 25
+EPOCHS = 10
 BATCH_SIZE = 16
-LEARNING_RATE = 3e-4
-NUM_WORKERS = 2
-IMAGE_SIZE = 224
-WEIGHT_DECAY = 1e-4
-USE_AMP = True
+LEARNING_RATE = 0.0001
 RANDOM_SEED = 42
-
 PROJECT_NAME = "Chihuahua-Muffin"
 DATASET_NAME = "chihuahua-muffin"
-
-NUM_CLASSES = 2
+NUM_CLASSES = 2  # chihuahua, muffin (undefined excluded from training)
 CLASS_NAMES = ["chihuahua", "muffin", "undefined"]
-
+# Competition rule: train from scratch. No pretrained weights allowed.
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def load_config():
-    config_path = Path(__file__).parent / "config.yaml"
-
-    if not config_path.exists():
-        return {}
-
-    with open(config_path, "r", encoding="utf-8") as file:
-        return yaml.safe_load(file) or {}
-
-
-cfg = load_config()
-training_cfg = cfg.get("training", {})
-system_cfg = cfg.get("system", {})
-tlc_cfg = cfg.get("tlc", {})
-
-EPOCHS = int(training_cfg.get("epochs", EPOCHS))
-BATCH_SIZE = int(training_cfg.get("batch_size", BATCH_SIZE))
-LEARNING_RATE = float(training_cfg.get("learning_rate", LEARNING_RATE))
-NUM_WORKERS = int(training_cfg.get("num_workers", NUM_WORKERS))
-IMAGE_SIZE = int(training_cfg.get("image_size", IMAGE_SIZE))
-WEIGHT_DECAY = float(training_cfg.get("weight_decay", WEIGHT_DECAY))
-USE_AMP = bool(training_cfg.get("use_amp", USE_AMP))
-
-RANDOM_SEED = int(system_cfg.get("seed", RANDOM_SEED))
-PROJECT_NAME = tlc_cfg.get("project_name", PROJECT_NAME)
-DATASET_NAME = tlc_cfg.get("dataset_name", DATASET_NAME)
-
 print(f"Using device: {device}")
-print("ResNet18 training from scratch (competition rule)")
-print(
-    f"Config -> epochs={EPOCHS}, batch_size={BATCH_SIZE}, "
-    f"lr={LEARNING_RATE}, workers={NUM_WORKERS}, image={IMAGE_SIZE}, amp={USE_AMP}"
-)
+print(f"ResNet-18: random init (no pretrained weights no pretrained weights (competition rule)."""
+   def __init__(self, num_classes=2):
+       super(ResNet18Classifier, self).__init__()
+       # No pretrained weights: competition requires training from scratch.
+       self.resnet = models.resnet18(weights=None)
+       resnet_features = self.resnet.fc.in_features
+       self.resnet.fc = nn.Identity()
+       self.classifier = nn.Sequential(
+           nn.Linear(resnet_features, 256),
+           nn.ReLU(),
+           nn.Dropout(0.3),
+           nn.Linear(256, 128),
+           nn.ReLU(),
+           nn.Dropout(0.3),
+           nn.Linear(128, num_classes),
+       )
 
-# ============================================================================
-# SEED
-# ============================================================================
+   def forward(self, x):
+       features = self.resnet(x)
+       return self.classifier(features)
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-set_seed(RANDOM_SEED)
-
-# ============================================================================
-# MODEL
-# ============================================================================
-
-class ResNet18Classifier(nn.Module):
-
-    def __init__(self, num_classes=2):
-        super().__init__()
-
-        self.resnet = models.resnet18(weights=None)
-        resnet_features = self.resnet.fc.in_features
-        self.resnet.fc = nn.Identity()
-
-        self.classifier = nn.Sequential(
-            nn.Linear(resnet_features, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, x):
-        features = self.resnet(x)
-        return self.classifier(features)
 
 # ============================================================================
 # TRANSFORMS
 # ============================================================================
 
 train_transform = transforms.Compose([
-    transforms.Resize(int(IMAGE_SIZE * 256 / 224)),
-    transforms.RandomResizedCrop(IMAGE_SIZE),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(0.2,0.2,0.2,0.1),
-    transforms.RandomAffine(0, shear=10, scale=(0.8,1.2)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        [0.485,0.456,0.406],
-        [0.229,0.224,0.225]
-    ),
+   transforms.Resize(128),
+   transforms.RandomCrop(128),
+   transforms.RandomHorizontalFlip(),
+   transforms.RandomAffine(0, shear=10, scale=(0.8, 1.2)),
+   transforms.ToTensor(),
+   transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+val_transform = transforms.Compose([
+   transforms.Resize(128),
+   transforms.CenterCrop(128),
+   transforms.ToTensor(),
+   transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-val_transform = transforms.Compose([
-    transforms.Resize(int(IMAGE_SIZE * 256 / 224)),
-    transforms.CenterCrop(IMAGE_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        [0.485,0.456,0.406],
-        [0.229,0.224,0.225]
-    ),
-])
 
 def train_fn(sample):
-    image = Image.open(sample["image"])
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    return train_transform(image), sample["label"]
+   image = Image.open(sample["image"])
+   if image.mode != "RGB":
+       image = image.convert("RGB")
+   return train_transform(image), sample["label"]
+
 
 def val_fn(sample):
-    image = Image.open(sample["image"])
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    return val_transform(image), sample["label"]
+   image = Image.open(sample["image"])
+   if image.mode != "RGB":
+       image = image.convert("RGB")
+   return val_transform(image), sample["label"]
+
 
 # ============================================================================
 # METRICS
 # ============================================================================
 
 def metrics_fn(batch, predictor_output: tlc.PredictorOutput):
+   labels = batch[1].to(device)
+   predictions = predictor_output.forward
+   softmax_output = F.softmax(predictions, dim=1)
+   predicted_indices = torch.argmax(predictions, dim=1)
+   confidence = torch.gather(softmax_output, 1, predicted_indices.unsqueeze(1)).squeeze(1)
+   accuracy = (predicted_indices == labels).float()
+   valid_labels = labels < predictions.shape[1]
+   cross_entropy_loss = torch.ones_like(labels, dtype=torch.float32)
+   cross_entropy_loss[valid_labels] = nn.CrossEntropyLoss(reduction="none")(
+       predictions[valid_labels], labels[valid_labels]
+   )
+   return {
+       "loss": cross_entropy_loss.cpu().numpy(),
+       "predicted": predicted_indices.cpu().numpy(),
+       "accuracy": accuracy.cpu().numpy(),
+       "confidence": confidence.cpu().numpy(),
+   }
 
-    labels = batch[1].to(device)
-    predictions = predictor_output.forward
-
-    softmax_output = F.softmax(predictions, dim=1)
-    predicted_indices = torch.argmax(predictions, dim=1)
-
-    confidence = torch.gather(
-        softmax_output,
-        1,
-        predicted_indices.unsqueeze(1)
-    ).squeeze(1)
-
-    accuracy = (predicted_indices == labels).float()
-
-    valid_labels = labels < predictions.shape[1]
-
-    cross_entropy_loss = torch.ones_like(labels, dtype=torch.float32)
-
-    cross_entropy_loss[valid_labels] = nn.CrossEntropyLoss(
-        reduction="none"
-    )(predictions[valid_labels], labels[valid_labels])
-
-    return {
-        "loss": cross_entropy_loss.cpu().numpy(),
-        "predicted": predicted_indices.cpu().numpy(),
-        "accuracy": accuracy.cpu().numpy(),
-        "confidence": confidence.cpu().numpy(),
-    }
 
 # ============================================================================
-# TRAIN
+# TRAINING
 # ============================================================================
 
+# Default: output path for best model (overwritten each run)
 BEST_MODEL_FILENAME = "best_model.pth"
 
+
 def train():
+   set_seed(RANDOM_SEED)
+   base_path = Path(__file__).parent
+   tlc.register_project_url_alias(
+       token="CHIHUAHUA_MUFFIN_DATA",
+       path=str(base_path.absolute()),
+       project=PROJECT_NAME,
+   )
+   print(f"[OK] Registered data path: {base_path.absolute()}")
 
-    base_path = Path(__file__).parent
+   # -------------------------------------------------------------------------
+   # Load 3LC Tables
+   # -------------------------------------------------------------------------
+   # OPTION 1 (default): Load by name with .latest() select table automatic latest revision)
+   train_table = tlc.Table.from_names(
+       project_name=PROJECT_NAME,
+       dataset_name=DATASET_NAME,
+       table_name="train",
+   ).latest()
+   val_table = tlc.Table.from_names(
+       project_name=PROJECT_NAME,
+       dataset_name=DATASET_NAME,
+       table_name="val",
+   ).latest()
 
-    tlc.register_project_url_alias(
-        token="CHIHUAHUA_MUFFIN_DATA",
-        path=str(base_path.absolute()),
-        project=PROJECT_NAME,
-    )
+   # OPTION 2: Load by URL (uncomment and set URLs to use a specific revision)
+   # TRAIN_TABLE_URL = "paste_your_train_table_url_here"
+   # VAL_TABLE_URL = "paste_your_val_table_url_here"
+   # train_table = tlc.Table.from_url(TRAIN_TABLE_URL)
+   # val_table = tlc.Table.from_url(VAL_TABLE_URL)
 
-    print("Loading tables...")
+   print(f"  Train: {len(train_table)} samples")
+   print(f"  Val:   {len(val_table)} samples")
+   print(f"  Train table URL: {train_table.url}")
+   print(f"  Val table URL:   {val_table.url}")
+   class_names = list(train_table.get_simple_value_map("label").values())
+   print(f"  Classes: {class_names}")
 
-    train_table = tlc.Table.from_names(
-        project_name=PROJECT_NAME,
-        dataset_name=DATASET_NAME,
-        table_name="train",
-    ).latest()
+   train_table.map(train_fn).map_collect_metrics(val_fn)
+   val_table.map(val_fn)
+   train_sampler = train_table.create_sampler(exclude_zero_weights=True)
+   train_dataloader = DataLoader(
+       train_table,
+       batch_size=BATCH_SIZE,
+       sampler=train_sampler,
+       num_workers=0,
+   )
+   val_dataloader = DataLoader(val_table, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    val_table = tlc.Table.from_names(
-        project_name=PROJECT_NAME,
-        dataset_name=DATASET_NAME,
-        table_name="val",
-    ).latest()
+   model = ResNet18Classifier(num_classes=NUM_CLASSES).to(device)
+   criterion = nn.CrossEntropyLoss()
+   optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+   scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
-    print("Train samples:", len(train_table))
-    print("Val samples:", len(val_table))
+   run = tlc.init(
+       project_name=PROJECT_NAME,
+       description="Chihuahua vs Muffin - data-centric workflow",
+   )
+   metric_schemas = {
+       "loss": tlc.Schema(description="Cross entropy loss", value=tlc.Float32Value()),
+       "predicted": tlc.CategoricalLabelSchema(display_name="predicted label", classes=class_names),
+       "accuracy": tlc.Schema(description="Per-sample accuracy", value=tlc.Float32Value()),
+       "confidence": tlc.Schema(description="Prediction confidence", value=tlc.Float32Value()),
+   }
+   classification_metrics_collector = tlc.FunctionalMetricsCollector(
+       collection_fn=metrics_fn,
+       column_schemas=metric_schemas,
+   )
+   indices_and_modules = list(enumerate(model.resnet.named_modules()))
+   resnet_fc_layer_index = next((i for i, (n, _) in indices_and_modules if n == "fc"), len(indices_and_modules) - 1)
+   embeddings_metrics_collector = tlc.EmbeddingsMetricsCollector(layers=[resnet_fc_layer_index])
+   predictor = tlc.Predictor(model, layers=[resnet_fc_layer_index])
 
-    class_names = list(train_table.get_simple_value_map("label").values())
+   best_val_accuracy = 0.0
+   best_model_state = None
+   print("\n" + "=" * 60)
+   print("  Starting Training")
+   print("=" * 60)
 
-    train_table.map(train_fn).map_collect_metrics(val_fn)
-    val_table.map(val_fn)
+   for epoch in range(EPOCHS):
+       model.train()
+       for images, labels in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
+           images, labels = images.to(device), labels.to(device)
+           optimizer.zero_grad()
+           outputs = model(images)
+           loss = criterion(outputs, labels)
+           loss.backward()
+           optimizer.step()
 
-    train_sampler = train_table.create_sampler(exclude_zero_weights=True)
+       model.eval()
+       val_correct, val_total = 0, 0
+       with torch.no_grad():
+           for images, labels in val_dataloader:
+               images, labels = images.to(device), labels.to(device)
+               pred = model(images).argmax(1)
+               val_correct += (pred == labels).sum().item()
+               val_total += labels.size(0)
+       val_accuracy = 100 * val_correct / val_total
+       scheduler.step()
+       print(f"Epoch {epoch+1}/{EPOCHS} - Val Acc: {val_accuracy:.2f}%")
+       if val_accuracy > best_val_accuracy:
+           best_val_accuracy = val_accuracy
+           best_model_state = model.state_dict().copy()
+           print(f"  --> New best model!")
+       tlc.log({"epoch": epoch, "val_accuracy": val_accuracy})
 
-    train_loader = DataLoader(
-        train_table,
-        batch_size=BATCH_SIZE,
-        sampler=train_sampler,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(NUM_WORKERS > 0)
-    )
+   print("\n" + "=" * 60)
+   print(f"  Best validation accuracy: {best_val_accuracy:.2f}%")
+   print("=" * 60)
 
-    val_loader = DataLoader(
-        val_table,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(NUM_WORKERS > 0)
-    )
+   if best_model_state is not None:
+       model.load_state_dict(best_model_state)
+   model_path = base_path / BEST_MODEL_FILENAME
+   torch.save(model.state_dict(), model_path)
+   print(f"[OK] Best model saved to {model_path} (overwrites previous run)")
 
-    model = ResNet18Classifier(num_classes=NUM_CLASSES).to(device)
+   print("\nCollecting metrics on train set...")
+   model.eval()
+   tlc.collect_metrics(
+       train_table,
+       predictor=predictor,
+       metrics_collectors=[classification_metrics_collector, embeddings_metrics_collector],
+       split="train",
+       dataloader_args={"batch_size": BATCH_SIZE, "num_workers": 0},
+   )
+   print("\nReducing embeddings...")
+   try:
+       # Use UMAP (default); PaCMAP can fail with "_var_var_13" on some setups (e.g. PyTorch nightly / RTX 50).
+       run.reduce_embeddings_by_foreign_table_url(
+           train_table.url,
+           method="umap",
+           n_neighbors=15,
+           n_components=3,
+       )
+       print("  [OK] Embeddings reduced (UMAP, 3D).")
+   except Exception as e:
+       print(f"  WARNING: Embedding reduction failed: {e}")
+       print("  Training and metrics are saved. Run and table are still valid; only the embedding view may be missing in the Dashboard.")
+   run.set_status_completed()
+   print("\n[OK] Done. View results at 3LC Dashboard (run: 3lc service)")
 
-    criterion = nn.CrossEntropyLoss()
-
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY
-    )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS
-    )
-
-    use_amp = USE_AMP and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    run = tlc.init(
-        project_name=PROJECT_NAME,
-        description="Improved training run"
-    )
-
-    indices_and_modules = list(enumerate(model.resnet.named_modules()))
-
-    resnet_fc_layer_index = next(
-        (i for i,(n,_) in indices_and_modules if n=="fc"),
-        len(indices_and_modules)-1
-    )
-
-    predictor = tlc.Predictor(model, layers=[resnet_fc_layer_index])
-
-    classification_metrics_collector = tlc.FunctionalMetricsCollector(
-        collection_fn=metrics_fn
-    )
-
-    embeddings_metrics_collector = tlc.EmbeddingsMetricsCollector(
-        layers=[resnet_fc_layer_index]
-    )
-
-    best_val_accuracy = 0.0
-    best_model_state = None
-
-    print("Starting training...")
-
-    for epoch in range(EPOCHS):
-
-        model.train()
-
-        for images, labels in tqdm(train_loader):
-
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            autocast_context = (
-                torch.cuda.amp.autocast(enabled=True) if use_amp else nullcontext()
-            )
-
-            with autocast_context:
-
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-        model.eval()
-
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-
-            for images, labels in val_loader:
-
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-
-                preds = model(images).argmax(1)
-
-                val_correct += (preds == labels).sum().item()
-                val_total += labels.size(0)
-
-        val_acc = 100 * val_correct / val_total
-
-        scheduler.step()
-
-        print(f"Epoch {epoch+1}/{EPOCHS}  Val Acc: {val_acc:.2f}%")
-
-        if val_acc > best_val_accuracy:
-
-            best_val_accuracy = val_acc
-            best_model_state = model.state_dict().copy()
-
-        tlc.log({"epoch": epoch, "val_accuracy": val_acc})
-
-    print("Best validation accuracy:", best_val_accuracy)
-
-    if best_model_state:
-        model.load_state_dict(best_model_state)
-
-    model_path = base_path / BEST_MODEL_FILENAME
-    torch.save(model.state_dict(), model_path)
-
-    print("Best model saved:", model_path)
-
-    print("Collecting metrics...")
-
-    tlc.collect_metrics(
-        train_table,
-        predictor=predictor,
-        metrics_collectors=[
-            classification_metrics_collector,
-            embeddings_metrics_collector
-        ],
-        split="train",
-        dataloader_args={
-            "batch_size": BATCH_SIZE,
-            "num_workers": NUM_WORKERS
-        },
-    )
-
-    print("Reducing embeddings...")
-
-    run.reduce_embeddings_by_foreign_table_url(
-        train_table.url,
-        method="umap",
-        n_neighbors=30,
-        min_dist=0.05,
-        n_components=3,
-    )
-
-    run.set_status_completed()
-
-    print("Training completed.")
 
 if __name__ == "__main__":
-    train()
+   train()
