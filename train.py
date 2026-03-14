@@ -25,14 +25,20 @@ from pathlib import Path
 import random
 import numpy as np
 import os
+import yaml
+from contextlib import nullcontext
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 
 EPOCHS = 25
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 LEARNING_RATE = 3e-4
+NUM_WORKERS = 2
+IMAGE_SIZE = 224
+WEIGHT_DECAY = 1e-4
+USE_AMP = True
 RANDOM_SEED = 42
 
 PROJECT_NAME = "Chihuahua-Muffin"
@@ -43,8 +49,40 @@ CLASS_NAMES = ["chihuahua", "muffin", "undefined"]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def load_config():
+    config_path = Path(__file__).parent / "config.yaml"
+
+    if not config_path.exists():
+        return {}
+
+    with open(config_path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
+
+
+cfg = load_config()
+training_cfg = cfg.get("training", {})
+system_cfg = cfg.get("system", {})
+tlc_cfg = cfg.get("tlc", {})
+
+EPOCHS = int(training_cfg.get("epochs", EPOCHS))
+BATCH_SIZE = int(training_cfg.get("batch_size", BATCH_SIZE))
+LEARNING_RATE = float(training_cfg.get("learning_rate", LEARNING_RATE))
+NUM_WORKERS = int(training_cfg.get("num_workers", NUM_WORKERS))
+IMAGE_SIZE = int(training_cfg.get("image_size", IMAGE_SIZE))
+WEIGHT_DECAY = float(training_cfg.get("weight_decay", WEIGHT_DECAY))
+USE_AMP = bool(training_cfg.get("use_amp", USE_AMP))
+
+RANDOM_SEED = int(system_cfg.get("seed", RANDOM_SEED))
+PROJECT_NAME = tlc_cfg.get("project_name", PROJECT_NAME)
+DATASET_NAME = tlc_cfg.get("dataset_name", DATASET_NAME)
+
 print(f"Using device: {device}")
 print("ResNet18 training from scratch (competition rule)")
+print(
+    f"Config -> epochs={EPOCHS}, batch_size={BATCH_SIZE}, "
+    f"lr={LEARNING_RATE}, workers={NUM_WORKERS}, image={IMAGE_SIZE}, amp={USE_AMP}"
+)
 
 # ============================================================================
 # SEED
@@ -88,8 +126,8 @@ class ResNet18Classifier(nn.Module):
 # ============================================================================
 
 train_transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.RandomResizedCrop(224),
+    transforms.Resize(int(IMAGE_SIZE * 256 / 224)),
+    transforms.RandomResizedCrop(IMAGE_SIZE),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
     transforms.ColorJitter(0.2,0.2,0.2,0.1),
@@ -102,8 +140,8 @@ train_transform = transforms.Compose([
 ])
 
 val_transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
+    transforms.Resize(int(IMAGE_SIZE * 256 / 224)),
+    transforms.CenterCrop(IMAGE_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(
         [0.485,0.456,0.406],
@@ -202,16 +240,18 @@ def train():
         train_table,
         batch_size=BATCH_SIZE,
         sampler=train_sampler,
-        num_workers=6,
-        pin_memory=True
+        num_workers=NUM_WORKERS,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(NUM_WORKERS > 0)
     )
 
     val_loader = DataLoader(
         val_table,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=6,
-        pin_memory=True
+        num_workers=NUM_WORKERS,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(NUM_WORKERS > 0)
     )
 
     model = ResNet18Classifier(num_classes=NUM_CLASSES).to(device)
@@ -221,7 +261,7 @@ def train():
     optimizer = optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE,
-        weight_decay=1e-4
+        weight_decay=WEIGHT_DECAY
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -229,7 +269,8 @@ def train():
         T_max=EPOCHS
     )
 
-    scaler = torch.cuda.amp.GradScaler()
+    use_amp = USE_AMP and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     run = tlc.init(
         project_name=PROJECT_NAME,
@@ -264,12 +305,16 @@ def train():
 
         for images, labels in tqdm(train_loader):
 
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            autocast_context = (
+                torch.cuda.amp.autocast(enabled=True) if use_amp else nullcontext()
+            )
+
+            with autocast_context:
 
                 outputs = model(images)
                 loss = criterion(outputs, labels)
@@ -287,8 +332,8 @@ def train():
 
             for images, labels in val_loader:
 
-                images = images.to(device)
-                labels = labels.to(device)
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 preds = model(images).argmax(1)
 
@@ -330,7 +375,7 @@ def train():
         split="train",
         dataloader_args={
             "batch_size": BATCH_SIZE,
-            "num_workers": 6
+            "num_workers": NUM_WORKERS
         },
     )
 
