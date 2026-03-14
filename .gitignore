@@ -31,6 +31,7 @@ pip-wheel-metadata/
 # Logs and temp files
 *.log
 *.tmp
+*.zip
 
 # IDE/editor settings
 .vscode/
