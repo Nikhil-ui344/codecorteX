@@ -4,12 +4,6 @@
 - ZIP file download (Google Drive): https://drive.google.com/file/d/1KHPGfZw6rHTZ0yYrpv40buq2M0ZhN-KH/view?usp=sharing
 
 A chill guide for the Chihuahua vs Muffin challenge using 3LC.
-## Ground Rules (Keep It Fair)
-
-- You receive a large dataset.
-- You must keep the model architecture fixed.
-- You must not use pretrained weights.
-- Base model: ResNet-18.
 
 Short version: improve data quality (labels + weights), not the architecture.
 ## Vibe Check: What You Need
