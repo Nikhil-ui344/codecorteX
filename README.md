@@ -1,4 +1,4 @@
-# Model for Medal
+﻿# MvsC
 
 A chill guide for the Chihuahua vs Muffin challenge using 3LC.
 ## Ground Rules (Keep It Fair)
